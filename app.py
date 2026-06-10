@@ -40,6 +40,12 @@ ELECTRICITY_QAR_KWH = 0.20
 WATER_QAR_M3 = 5.0
 COOLING_HOURS_YEAR = 1900
 T_SET_C = 25.0
+CGIS_GROUNDWATER_WELLS_URL = (
+    "https://services.gisqatar.org.qa/server/rest/services/Vector/Water/MapServer/1/query"
+    "?where=SUBTYPECD%3D2"
+    "&outFields=OBJECTID,SUBTYPEDESCRIPTION,LIFECYCLESTATUS,ASSETID,DATASOURCE"
+    "&returnGeometry=true&f=geojson&outSR=4326"
+)
 
 
 QATAR_POLYGON = Polygon(
@@ -355,11 +361,34 @@ def synthetic_landuse() -> gpd.GeoDataFrame:
     )
 
 
+def synthetic_groundwater_wells() -> gpd.GeoDataFrame:
+    records = [
+        ("GW-ALSHAHANIYA-01", "Synthetic hydrogeological well proxy", "Al Shahaniya aquifer access proxy", Point(51.08, 25.33)),
+        ("GW-RAWDAT-01", "Synthetic hydrogeological well proxy", "Rawdat Rashed farm well proxy", Point(51.08, 24.98)),
+        ("GW-UMMSALAL-01", "Synthetic hydrogeological well proxy", "Umm Salal groundwater proxy", Point(51.34, 25.50)),
+        ("GW-NORTH-01", "Synthetic hydrogeological well proxy", "Northern aquifer proxy", Point(51.15, 25.78)),
+        ("GW-SOUTH-01", "Synthetic hydrogeological well proxy", "Southern open-land groundwater proxy", Point(50.98, 24.78)),
+        ("GW-MESAIEED-01", "Synthetic hydrogeological well proxy", "Southern industrial fringe proxy", Point(51.42, 24.90)),
+    ]
+    return gpd.GeoDataFrame(
+        {
+            "name": [record[0] for record in records],
+            "subtype": [record[1] for record in records],
+            "source": [record[2] for record in records],
+        },
+        geometry=[record[3] for record in records],
+        crs=QATAR_CRS,
+    )
+
+
 def off_land_result() -> dict:
     return {
         "feasible": False,
         "landuse": "Water/offshore",
         "landuse_name": "Outside the Qatar land mask",
+        "groundwater_distance_m": float("inf"),
+        "groundwater_score": 0.0,
+        "groundwater_source": "Not applicable",
         "crop": "Not applicable",
         "technology": "Not applicable",
         "temp_c": np.nan,
@@ -407,6 +436,31 @@ def load_vector_layer(filename: str, fallback: str) -> gpd.GeoDataFrame:
     return synthetic_landuse()
 
 
+@st.cache_data(show_spinner=False)
+def load_groundwater_wells() -> gpd.GeoDataFrame:
+    local_path = DATA_DIR / "qatar_groundwater_wells.geojson"
+    if local_path.exists():
+        wells = gpd.read_file(local_path).to_crs(QATAR_CRS)
+        wells["source"] = wells.get("source", "Local qatar_groundwater_wells.geojson")
+        wells["subtype"] = wells.get("subtype", wells.get("SUBTYPEDESCRIPTION", "Groundwater well"))
+        wells["name"] = wells.get("name", wells.get("ASSETID", wells.index.astype(str)))
+        return wells
+
+    try:
+        wells = gpd.read_file(CGIS_GROUNDWATER_WELLS_URL).to_crs(QATAR_CRS)
+        if not wells.empty:
+            wells["name"] = wells.get("ASSETID", wells["OBJECTID"].astype(str) if "OBJECTID" in wells.columns else wells.index.astype(str))
+            wells["subtype"] = wells.get("SUBTYPEDESCRIPTION", "HydrogeologicalStation")
+            wells["source"] = "CGIS Qatar Vector/Water WATER.Facility HydrogeologicalStation"
+            return wells
+    except Exception:
+        pass
+
+    fallback = synthetic_groundwater_wells()
+    fallback["source"] = "Synthetic fallback; replace with CGIS or official groundwater wells GeoJSON"
+    return fallback
+
+
 def allowed_landuse(landuse: str) -> bool:
     return landuse in {"Agricultural", "Open desert/rangeland", "Unclassified open land"}
 
@@ -423,6 +477,21 @@ def point_distance_m(point: Point, layer: gpd.GeoDataFrame) -> float:
     point_gdf = gpd.GeoDataFrame(geometry=[point], crs=QATAR_CRS).to_crs(QATAR_METRIC_CRS)
     projected = layer.to_crs(QATAR_METRIC_CRS)
     return float(point_gdf.geometry.iloc[0].distance(projected.geometry).min())
+
+
+def nearest_feature_info(point: Point, layer: gpd.GeoDataFrame, name_field: str = "name") -> dict:
+    if layer.empty:
+        return {"distance_m": float("inf"), "name": "Unavailable", "source": "No groundwater layer"}
+    point_gdf = gpd.GeoDataFrame(geometry=[point], crs=QATAR_CRS).to_crs(QATAR_METRIC_CRS)
+    projected = layer.to_crs(QATAR_METRIC_CRS)
+    distances = projected.geometry.distance(point_gdf.geometry.iloc[0])
+    idx = distances.idxmin()
+    feature = layer.loc[idx]
+    return {
+        "distance_m": float(distances.loc[idx]),
+        "name": str(feature.get(name_field, feature.get("ASSETID", "Nearest groundwater feature"))),
+        "source": str(feature.get("source", "Groundwater layer")),
+    }
 
 
 def polygon_distance_m(poly: Polygon, layer: gpd.GeoDataFrame) -> float:
@@ -646,10 +715,13 @@ def calculate_suitability(lat: float, lon: float, weights: dict, layers: dict) -
             "landuse_score": 0.0,
             "grid_distance_m": float("inf"),
             "road_distance_m": float("inf"),
+            "groundwater_distance_m": float("inf"),
+            "groundwater_source": "Not applicable",
             "excluded_distance_m": float("inf"),
             "climate_score": 0.0,
             "grid_score": 0.0,
             "road_score": 0.0,
+            "groundwater_score": 0.0,
             "constraint_score": 0.0,
         }
 
@@ -657,11 +729,14 @@ def calculate_suitability(lat: float, lon: float, weights: dict, layers: dict) -
     lu = point_landuse(point, layers["landuse"])
     grid_distance = point_distance_m(point, layers["power"])
     road_distance = point_distance_m(point, layers["roads"])
+    groundwater_info = nearest_feature_info(point, layers["groundwater_wells"])
+    groundwater_distance = groundwater_info["distance_m"]
     excluded_distance = point_distance_m(point, layers["excluded_landuse"])
 
     climate_score = max(0.0, min(1.0, 1.0 - (climate["rh_pct"] - 38.0) / 35.0))
     grid_score = normalize_distance(grid_distance, 800.0, 28_000.0)
     road_score = normalize_distance(road_distance, 1_200.0, 24_000.0)
+    groundwater_score = normalize_distance(groundwater_distance, 2_000.0, 18_000.0)
     constraint_score = min(1.0, excluded_distance / 1500.0)
     if lu["greenhouse_ok"]:
         if lu["landuse"] == "Agricultural":
@@ -677,6 +752,7 @@ def calculate_suitability(lat: float, lon: float, weights: dict, layers: dict) -
         climate_score * weights["climate"]
         + grid_score * weights["grid"]
         + road_score * weights["logistics"]
+        + groundwater_score * weights["groundwater"]
         + landuse_score * weights["landuse"]
         + constraint_score * weights["constraints"]
     )
@@ -702,10 +778,14 @@ def calculate_suitability(lat: float, lon: float, weights: dict, layers: dict) -
         "landuse_name": lu["name"],
         "grid_distance_m": grid_distance,
         "road_distance_m": road_distance,
+        "groundwater_distance_m": groundwater_distance,
+        "groundwater_source": groundwater_info["source"],
+        "nearest_groundwater": groundwater_info["name"],
         "excluded_distance_m": excluded_distance,
         "climate_score": round(climate_score * 100.0, 1),
         "grid_score": round(grid_score * 100.0, 1),
         "road_score": round(road_score * 100.0, 1),
+        "groundwater_score": round(groundwater_score * 100.0, 1),
         "landuse_score": round(landuse_score * 100.0, 1),
         "constraint_score": round(constraint_score * 100.0, 1),
     }
@@ -736,6 +816,7 @@ def build_heatmap_runtime(weights: dict, layers: dict) -> gpd.GeoDataFrame:
                     "score": result["score"],
                     "status": result["status"],
                     "landuse": result["landuse"],
+                    "groundwater_km": round(result["groundwater_distance_m"] / 1000.0, 1) if np.isfinite(result["groundwater_distance_m"]) else None,
                     "is_excluded": result["is_excluded"],
                     "geometry": point.buffer(0.018),
                 }
@@ -759,7 +840,27 @@ def add_geojson(map_object: folium.Map, gdf: gpd.GeoDataFrame, name: str, color:
     ).add_to(map_object)
 
 
-def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap: bool, show_infra: bool, show_landuse: bool) -> folium.Map:
+def add_groundwater_wells(map_object: folium.Map, wells: gpd.GeoDataFrame) -> None:
+    if wells.empty:
+        return
+    group = folium.FeatureGroup(name="Groundwater / hydrogeological stations", show=True)
+    for _, row in wells.iterrows():
+        geometry = row.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        folium.CircleMarker(
+            location=[geometry.y, geometry.x],
+            radius=5,
+            color="#0f766e",
+            fill=True,
+            fill_color="#14b8a6",
+            fill_opacity=0.85,
+            tooltip=f"{row.get('name', 'Groundwater feature')} | {row.get('subtype', 'HydrogeologicalStation')}",
+        ).add_to(group)
+    group.add_to(map_object)
+
+
+def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap: bool, show_infra: bool, show_landuse: bool, show_groundwater: bool) -> folium.Map:
     map_object = folium.Map(location=[25.3548, 51.1839], zoom_start=9, tiles="CartoDB positron", control_scale=True)
     folium.Rectangle(
         bounds=[[24.48, 50.66], [26.22, 51.72]],
@@ -778,7 +879,7 @@ def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap:
         folium.GeoJson(
             heatmap,
             name="Feasible suitability heatmap",
-            tooltip=folium.GeoJsonTooltip(fields=["score", "status", "landuse"]),
+            tooltip=folium.GeoJsonTooltip(fields=["score", "status", "landuse", "groundwater_km"]),
             style_function=lambda feature: {
                 "fillColor": score_color(float(feature["properties"]["score"]), bool(feature["properties"]["is_excluded"])),
                 "color": score_color(float(feature["properties"]["score"]), bool(feature["properties"]["is_excluded"])),
@@ -796,6 +897,9 @@ def build_map(lat: float, lon: float, weights: dict, layers: dict, show_heatmap:
     if show_infra:
         add_geojson(map_object, layers["power"], "Power grid proxy", "#c0262d", weight=4)
         add_geojson(map_object, layers["roads"], "Primary highways", "#2563eb", weight=4)
+
+    if show_groundwater:
+        add_groundwater_wells(map_object, layers["groundwater_wells"])
 
     marker_color = "red" if not QATAR_POLYGON.contains(Point(lon, lat)) else "green"
     marker_text = "Selected point - water/offshore" if marker_color == "red" else "Selected greenhouse site"
@@ -882,10 +986,12 @@ st.markdown(
 power_lines = load_vector_layer("qatar_kahramaa_lines.geojson", "power")
 roads = load_vector_layer("qatar_ashghal_roads.geojson", "roads")
 landuse = load_vector_layer("qatar_landuse.geojson", "landuse")
+groundwater_wells = load_groundwater_wells()
 allowed_landuse_gdf, excluded_landuse_gdf = split_landuse(landuse)
 layers = {
     "power": power_lines,
     "roads": roads,
+    "groundwater_wells": groundwater_wells,
     "landuse": landuse,
     "allowed_landuse": allowed_landuse_gdf,
     "excluded_landuse": excluded_landuse_gdf,
@@ -901,15 +1007,17 @@ st.caption("Land, water, land-use, crop-technology optimisation, and greenhouse 
 with st.sidebar:
     st.header("Suitability Weights")
     w_climate = st.slider("Low-humidity microclimate", 0.0, 1.0, 0.26, 0.01)
-    w_grid = st.slider("Power grid proximity", 0.0, 1.0, 0.18, 0.01)
-    w_logistics = st.slider("Highway logistics", 0.0, 1.0, 0.14, 0.01)
+    w_grid = st.slider("Power grid proximity", 0.0, 1.0, 0.16, 0.01)
+    w_logistics = st.slider("Highway logistics", 0.0, 1.0, 0.12, 0.01)
+    w_groundwater = st.slider("Groundwater availability", 0.0, 1.0, 0.14, 0.01)
     w_landuse = st.slider("Permitted land use", 0.0, 1.0, 0.32, 0.01)
     w_constraints = st.slider("Buffer from exclusions", 0.0, 1.0, 0.10, 0.01)
-    total_weight = max(w_climate + w_grid + w_logistics + w_landuse + w_constraints, 0.01)
+    total_weight = max(w_climate + w_grid + w_logistics + w_groundwater + w_landuse + w_constraints, 0.01)
     weights = {
         "climate": w_climate / total_weight,
         "grid": w_grid / total_weight,
         "logistics": w_logistics / total_weight,
+        "groundwater": w_groundwater / total_weight,
         "landuse": w_landuse / total_weight,
         "constraints": w_constraints / total_weight,
     }
@@ -923,6 +1031,7 @@ with st.sidebar:
     show_heatmap = st.toggle("Suitability heatmap", value=True)
     show_landuse = st.toggle("Land-use layer", value=True)
     show_infra = st.toggle("Infrastructure layers", value=True)
+    show_groundwater = st.toggle("Groundwater wells", value=True)
 
 tab_map, tab_compare, tab_opt, tab_notes = st.tabs(["Suitability Map", "Crop-Tech Comparison", "Investment & Optimisation", "Model Notes"])
 
@@ -936,7 +1045,7 @@ with tab_map:
     map_col, metric_col = st.columns([2.15, 0.85], gap="medium")
     with map_col:
         st.subheader("National Feasibility Map")
-        map_object = build_map(lat, lon, weights, layers, show_heatmap, show_infra, show_landuse)
+        map_object = build_map(lat, lon, weights, layers, show_heatmap, show_infra, show_landuse, show_groundwater)
         map_data = st_folium(map_object, height=760, use_container_width=True)
         if map_data and map_data.get("last_clicked"):
             st.session_state.selected_lat = map_data["last_clicked"]["lat"]
@@ -960,8 +1069,11 @@ with tab_map:
         c1, c2 = st.columns(2)
         c1.metric("Grid distance", format_distance(float(suitability["grid_distance_m"])))
         c2.metric("Road distance", format_distance(float(suitability["road_distance_m"])))
+        c1.metric("Groundwater distance", format_distance(float(suitability["groundwater_distance_m"])))
+        c2.metric("Groundwater score", f"{suitability['groundwater_score']:.0f}/100")
         c1.metric("Land-use score", f"{suitability['landuse_score']:.0f}/100")
         c2.metric("Exclusion buffer", format_distance(float(suitability["excluded_distance_m"])))
+        st.caption(f"Groundwater source: {suitability.get('groundwater_source', 'Not available')}")
 
         default_report = analyze_location(lat, lon, CROP_DATABASE["Tomato - truss/cherry"], GREENHOUSE_TECHS["Fan-pad evaporative"], int(area_m2), transmissivity, recycle, landuse)
         with st.expander("Site report: tomato + fan-pad", expanded=not suitability["is_excluded"]):
@@ -978,11 +1090,12 @@ with tab_map:
 
     score_df = pd.DataFrame(
         {
-            "Factor": ["Microclimate", "Power grid", "Highway logistics", "Permitted land use", "Exclusion buffer"],
+            "Factor": ["Microclimate", "Power grid", "Highway logistics", "Groundwater", "Permitted land use", "Exclusion buffer"],
             "Score": [
                 suitability["climate_score"],
                 suitability["grid_score"],
                 suitability["road_score"],
+                suitability["groundwater_score"],
                 suitability["landuse_score"],
                 suitability["constraint_score"],
             ],
