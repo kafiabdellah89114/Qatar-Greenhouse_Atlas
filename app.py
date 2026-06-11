@@ -1074,6 +1074,11 @@ with tab_map:
         c1.metric("Land-use score", f"{suitability['landuse_score']:.0f}/100")
         c2.metric("Exclusion buffer", format_distance(float(suitability["excluded_distance_m"])))
         st.caption(f"Groundwater source: {suitability.get('groundwater_source', 'Not available')}")
+        st.caption(
+            "Groundwater note: the public CGIS layer validates hydrogeological station locations. "
+            "Quality/quantity attributes such as TDS, salinity, well yield, pumping depth, and permitted abstraction "
+            "should be joined from official agency, utility, monitoring, or lab datasets when available."
+        )
 
         default_report = analyze_location(lat, lon, CROP_DATABASE["Tomato - truss/cherry"], GREENHOUSE_TECHS["Fan-pad evaporative"], int(area_m2), transmissivity, recycle, landuse)
         with st.expander("Site report: tomato + fan-pad", expanded=not suitability["is_excluded"]):
